@@ -85,7 +85,7 @@ static ULONGLONG lastTotal, lastIdle;
 static int sortCol = 3, sortDesc = 1, dpi = 96, ctlH, btnW;
 static WCHAR query[128];
 static NOTIFYICONDATAW nid;
-static UINT wmTaskbarCreated;
+static UINT wmTaskbarCreated, wmShowMe;
 static PDH_HQUERY pq;
 static PDH_HCOUNTER pc;
 static int diskT[16], nDisk, tick;
@@ -357,6 +357,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         Shell_NotifyIconW(NIM_ADD, &nid);
         return 0;
     }
+    if (msg == wmShowMe) { // a second launch asked us to come to the front
+        Restore();
+        return 0;
+    }
     switch (msg) {
     case WM_CREATE: {
         NONCLIENTMETRICSW nm = { sizeof nm };
@@ -409,6 +413,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // When running as admin, UIPI blocks tray messages from Explorer (normal integrity); allow them
         ChangeWindowMessageFilterEx(h, WM_TRAY, MSGFLT_ALLOW, NULL);
         ChangeWindowMessageFilterEx(h, wmTaskbarCreated, MSGFLT_ALLOW, NULL);
+        ChangeWindowMessageFilterEx(h, wmShowMe, MSGFLT_ALLOW, NULL); // a non-admin second launch must reach an admin instance
         Shell_NotifyIconW(NIM_ADD, &nid); // the tray icon stays until exit
         Refresh();
         SetTimer(h, 1, 1000, NULL);
@@ -482,6 +487,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
+    // Single instance per session, however it's launched (double-click, shortcut, run as admin, renamed copy):
+    // a second launch wakes the running window and exits. CreateMutex fails with ACCESS_DENIED when the
+    // running copy is elevated and this one isn't, which also means "already running".
+    wmShowMe = RegisterWindowMessageW(L"OBTaskmgr.ShowMe");
+    HANDLE mtx = CreateMutexW(NULL, FALSE, L"Local\\OBTaskmgr.SingleInstance"); // held until the process exits
+    if (!mtx || GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND w = FindWindowW(L"OBTaskmgr", NULL); // also finds the window while it's hidden in the tray
+        if (w) {
+            DWORD pid;
+            GetWindowThreadProcessId(w, &pid);
+            AllowSetForegroundWindow(pid); // we were just launched by the user, so we may hand over foreground rights
+            PostMessageW(w, wmShowMe, 0, 0);
+        }
+        return 0;
+    }
     INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
     HDC dc = GetDC(NULL);

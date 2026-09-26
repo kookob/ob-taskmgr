@@ -36,6 +36,7 @@ Test machine: Windows 11, Intel i9-12900HX (24 threads), 150% display scaling, ~
 
 - Status bar with the process count, total CPU and memory usage, plus CPU and disk temperatures when available
 - Tray icon: minimizing hides the window to the tray. Click the icon to restore the window, or right-click for **Restore / Exit**.
+- Single instance: launching it again, in any way, brings the running window to the front
 - DPI-aware, and uses the system UI font
 
 ## Download
