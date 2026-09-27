@@ -26,6 +26,8 @@
 #define TXT_CONFIRM_END   L"End %ls (PID %lu)?\nAny unsaved data will be lost."
 #define TXT_END_FAILED    L"Failed to end process (error %lu)%ls"
 #define TXT_ACCESS_DENIED L"\nAccess denied. Try running OB Taskmgr as administrator."
+#define TXT_OPEN_LOCATION L"Open file location"
+#define TXT_COPY_NAME     L"Copy name"
 #define TXT_RESTORE       L"Restore"
 #define TXT_EXIT          L"Exit"
 
@@ -310,6 +312,51 @@ static void KillSelected(void) {
     Refresh();
 }
 
+static void CopyText(const WCHAR *s) {
+    int n = (lstrlenW(s) + 1) * 2;
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
+    if (!g) return;
+    memcpy(GlobalLock(g), s, n);
+    GlobalUnlock(g);
+    if (OpenClipboard(hWnd)) {
+        EmptyClipboard();
+        if (SetClipboardData(CF_UNICODETEXT, g)) g = NULL; // the clipboard owns it now
+        CloseClipboard();
+    }
+    if (g) GlobalFree(g);
+}
+
+// Right-click (or Shift+F10 / menu key) on a row: Copy name / Open file location / End task
+static void ListMenu(LPARAM lp) {
+    int sel = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
+    if (sel < 0) return;
+    POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+    if (lp == -1) { // keyboard: open below the selected row
+        RECT r;
+        ListView_GetItemRect(hList, sel, &r, LVIR_LABEL);
+        pt.x = r.left, pt.y = r.bottom;
+        ClientToScreen(hList, &pt);
+    }
+    WCHAR name[128], path[MAX_PATH], args[MAX_PATH + 16];
+    DWORD n = MAX_PATH, pid = shown[view[sel]].pid; // copy: the timer keeps refreshing while the menu is open
+    lstrcpynW(name, shown[view[sel]].name, 128);
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    BOOL hasPath = h && QueryFullProcessImageNameW(h, 0, path, &n); // fails for System, Registry, etc.
+    if (h) CloseHandle(h);
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, 3, TXT_COPY_NAME);
+    AppendMenuW(m, MF_STRING | (hasPath ? 0 : MF_GRAYED), 2, TXT_OPEN_LOCATION);
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, 1, TXT_END_TASK);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
+    DestroyMenu(m);
+    if (cmd == 1) KillSelected();
+    else if (cmd == 2) {
+        _snwprintf(args, MAX_PATH + 16, L"/select,\"%ls\"", path);
+        ShellExecuteW(hWnd, NULL, L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+    } else if (cmd == 3) CopyText(name);
+}
+
 static void Restore(void) {
     int hidden = IsIconic(hWnd);
     ShowWindow(hWnd, hidden ? SW_RESTORE : SW_SHOW); // SW_RESTORE on a shown window would un-maximize it
@@ -446,6 +493,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             GetWindowTextW(hSearch, query, 128);
             ApplyView();
         } else if (LOWORD(wp) == ID_KILL) KillSelected();
+        return 0;
+    case WM_CONTEXTMENU: // the ListView forwards right-clicks here; wp is the header for header right-clicks
+        if ((HWND)wp != hList) break; // title bar right-click still gets the system menu
+        ListMenu(lp);
         return 0;
     case WM_NOTIFY: {
         NMHDR *n = (NMHDR *)lp;

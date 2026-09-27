@@ -27,6 +27,7 @@ Test machine: Windows 11, Intel i9-12900HX (24 threads), 150% display scaling, ~
 - Search by process name (substring match, case-insensitive) or exact PID
 - Click a column header to sort, and click again to reverse the order
 - End a process with the **End task** button or the <kbd>Del</kbd> key, after a confirmation prompt
+- Right-click a process for **Copy name / Open file location / End task**
 - Rows with high usage are highlighted:
 
   | | CPU | Memory |
