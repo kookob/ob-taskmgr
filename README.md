@@ -24,10 +24,10 @@ Test machine: Windows 11, Intel i9-12900HX (24 threads), 150% display scaling, ~
 
 - Process list with name, PID, CPU and memory, refreshed every second
 - CPU is shown as a percentage of the whole machine. Memory is the private working set, the same metric as Task Manager's "Memory" column.
-- Search by process name (substring match, case-insensitive) or exact PID
+- Search by process name (substring match, case-insensitive) or exact PID. <kbd>Ctrl</kbd>+<kbd>F</kbd> jumps to the search box, and the **×** inside it clears the search.
 - Click a column header to sort, and click again to reverse the order
 - End a process with the **End task** button or the <kbd>Del</kbd> key, after a confirmation prompt
-- Right-click a process for **Copy name / Open file location / End task**
+- Right-click a process for **Pin to top / Copy name / Open file location / End task**. Pinning works by process name: every process with that name stays at the top in bold whatever the sort, and the pins are remembered across restarts (see **Settings file** below). Choose **Unpin** to release them.
 - Rows with high usage are highlighted:
 
   | | CPU | Memory |
@@ -60,6 +60,7 @@ This produces `obtaskmgr.exe`, a statically linked exe that only depends on Wind
 - **CPU temperature** comes from the ACPI thermal zone reported by the BIOS/EC. On most laptops this sensor sits near the CPU, but it isn't the per-core temperature that tools like HWiNFO show. Many desktops have no thermal zone, or report a fixed dummy value. If no thermal zone is available, the reading is hidden.
 - **Disk temperature** uses the Windows storage temperature API (NVMe and most SSDs) and doesn't need admin rights. It's read every 10 seconds. Hard disks (HDDs) are skipped so the app never wakes a sleeping disk.
 - Readings that aren't available are simply not shown.
+- **Settings file**: pinned processes are saved in `obtaskmgr.ini` next to the exe, so deleting the folder removes everything. If that folder isn't writable (for example under `C:\Program Files`), the file goes to `%APPDATA%\OBTaskmgr\obtaskmgr.ini` instead. Nothing is written to the registry.
 
 ## How it stays light
 

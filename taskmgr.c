@@ -15,6 +15,7 @@
 // ---- UI text: every user-visible string lives here ----
 #define TXT_TITLE         L"OB Taskmgr"
 #define TXT_SEARCH_HINT   L"Search name or PID"
+#define TXT_CLEAR         L"×"
 #define TXT_END_TASK      L"End task"
 #define TXT_COL_NAME      L"Name"
 #define TXT_COL_PID       L"PID"
@@ -28,6 +29,8 @@
 #define TXT_ACCESS_DENIED L"\nAccess denied. Try running OB Taskmgr as administrator."
 #define TXT_OPEN_LOCATION L"Open file location"
 #define TXT_COPY_NAME     L"Copy name"
+#define TXT_PIN           L"Pin to top"
+#define TXT_UNPIN         L"Unpin"
 #define TXT_RESTORE       L"Restore"
 #define TXT_EXIT          L"Exit"
 
@@ -73,11 +76,12 @@ typedef struct {
     LONGLONG create, time; // creation time / total CPU time (100 ns units)
     double cpu;            // %
     ULONGLONG mem;         // private working set, same metric as Task Manager's "Memory" column
+    BOOL pinned;           // name is in pins[]: kept at the top of the list whatever the sort
 } Proc;
 
 typedef struct { Proc *p; int n, cap; } Snap;
 
-static HWND hWnd, hList, hHeader, hSearch, hKill, hStatus;
+static HWND hWnd, hList, hHeader, hSearch, hClear, hKill, hStatus;
 static HFONT boldFont;
 static int rightW; // width of the status bar's temperature part
 static Snap snaps[2]; static int si;  // snaps[si] is the current sample, the other is the previous one
@@ -91,6 +95,7 @@ static UINT wmTaskbarCreated, wmShowMe;
 static PDH_HQUERY pq;
 static PDH_HCOUNTER pc;
 static int diskT[16], nDisk, tick;
+static WCHAR pins[64][128]; static int nPins; // pinned process names, saved in obtaskmgr.ini (ponytail: 64 max, grow if anyone hits it)
 
 static int S(int x) { return MulDiv(x, dpi, 96); }
 static ULONGLONG U(FILETIME f) { return (ULONGLONG)f.dwHighDateTime << 32 | f.dwLowDateTime; }
@@ -112,6 +117,50 @@ static int Match(const Proc *p) {
     return StrStrIW(p->name, query) || !wcscmp(s, query);
 }
 
+// Pins are by name (PIDs change on every run), saved as "Pinned=a.exe|b.exe" ('|' can't appear in a file name)
+// in obtaskmgr.ini next to the exe, or in %APPDATA%\OBTaskmgr when the exe's folder isn't writable
+#define INI_NAME    L"obtaskmgr.ini"
+#define APPDATA_DIR L"%APPDATA%\\OBTaskmgr"
+static WCHAR ini[MAX_PATH];
+
+static int Pinned(const WCHAR *name) {
+    for (int i = 0; i < nPins; i++)
+        if (!_wcsicmp(pins[i], name)) return 1;
+    return 0;
+}
+
+static void LoadPins(void) {
+    static WCHAR b[64 * 128 + 2];
+    WCHAR alt[MAX_PATH];
+    GetModuleFileNameW(NULL, ini, MAX_PATH);
+    PathRemoveFileSpecW(ini);
+    PathAppendW(ini, INI_NAME);
+    ExpandEnvironmentStringsW(APPDATA_DIR L"\\" INI_NAME, alt, MAX_PATH);
+    if (!PathFileExistsW(ini) && PathFileExistsW(alt)) lstrcpyW(ini, alt); // an earlier run had to fall back
+    DWORD n = GetPrivateProfileStringW(L"Settings", L"Pinned", L"", b, 64 * 128, ini);
+    b[n + 1] = 0; // split on '|' into a double-null-terminated list
+    for (DWORD i = 0; i < n; i++)
+        if (b[i] == '|') b[i] = 0;
+    for (WCHAR *s = b; *s && nPins < 64; s += lstrlenW(s) + 1) lstrcpynW(pins[nPins++], s, 128);
+}
+
+static void TogglePin(const WCHAR *name) {
+    static WCHAR b[64 * 128 + 1];
+    int i = 0, k = 0;
+    while (i < nPins && _wcsicmp(pins[i], name)) i++;
+    if (i < nPins) memmove(pins[i], pins[--nPins], sizeof *pins); // unpin: the last one fills the gap
+    else if (nPins < 64) lstrcpynW(pins[nPins++], name, 128);
+    for (i = 0; i < nPins; i++) k += lstrlenW(lstrcpyW(b + k, pins[i])), b[k++] = '|';
+    b[k ? k - 1 : 0] = 0; // drop the trailing '|'
+    if (!WritePrivateProfileStringW(L"Settings", L"Pinned", b, ini)) { // exe folder not writable (e.g. Program Files)
+        ExpandEnvironmentStringsW(APPDATA_DIR, ini, MAX_PATH);
+        CreateDirectoryW(ini, NULL);
+        PathAppendW(ini, INI_NAME);
+        WritePrivateProfileStringW(L"Settings", L"Pinned", b, ini);
+    }
+    for (i = 0; i < snaps[si].n; i++) snaps[si].p[i].pinned = Pinned(snaps[si].p[i].name);
+}
+
 #define CMP(a, b) (((a) > (b)) - ((a) < (b)))
 static int Cmp(const void *a, const void *b) {
     const Proc *x = &snaps[si].p[*(const int *)a], *y = &snaps[si].p[*(const int *)b];
@@ -120,6 +169,7 @@ static int Cmp(const void *a, const void *b) {
           : sortCol == 2 ? CMP(x->cpu, y->cpu)
           :                CMP(x->mem, y->mem);
     if (!r) r = CMP(x->pid, y->pid);
+    if (x->pinned != y->pinned) return y->pinned - x->pinned;
     return sortDesc ? -r : r;
 }
 
@@ -245,6 +295,7 @@ static void Refresh(void) {
             p->time = e->UserTime.QuadPart + e->KernelTime.QuadPart;
             p->mem = e->WorkingSetPrivateSize.QuadPart;
             p->cpu = 0;
+            p->pinned = Pinned(p->name);
             // O(n²) match against the previous sample: <1 ms for a few hundred processes; use a hash for tens of thousands
             for (int i = 0; dt > 0 && i < o->n; i++)
                 if (o->p[i].pid == pid && o->p[i].create == p->create) {
@@ -326,24 +377,29 @@ static void CopyText(const WCHAR *s) {
     if (g) GlobalFree(g);
 }
 
-// Right-click (or Shift+F10 / menu key) on a row: Copy name / Open file location / End task
+// Right-click (or Shift+F10 / menu key) on a row: Pin to top / Copy name / Open file location / End task
 static void ListMenu(LPARAM lp) {
     int sel = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
     if (sel < 0) return;
     POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
-    if (lp == -1) { // keyboard: open below the selected row
-        RECT r;
+    RECT r;
+    if (lp != -1) { // mouse: the ListView also forwards right-clicks on the column header, skip those
+        GetWindowRect(hHeader, &r);
+        if (PtInRect(&r, pt)) return;
+    } else { // keyboard: open below the selected row
         ListView_GetItemRect(hList, sel, &r, LVIR_LABEL);
         pt.x = r.left, pt.y = r.bottom;
         ClientToScreen(hList, &pt);
     }
     WCHAR name[128], path[MAX_PATH], args[MAX_PATH + 16];
     DWORD n = MAX_PATH, pid = shown[view[sel]].pid; // copy: the timer keeps refreshing while the menu is open
+    BOOL pinned = shown[view[sel]].pinned;
     lstrcpynW(name, shown[view[sel]].name, 128);
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     BOOL hasPath = h && QueryFullProcessImageNameW(h, 0, path, &n); // fails for System, Registry, etc.
     if (h) CloseHandle(h);
     HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, 4, pinned ? TXT_UNPIN : TXT_PIN);
     AppendMenuW(m, MF_STRING, 3, TXT_COPY_NAME);
     AppendMenuW(m, MF_STRING | (hasPath ? 0 : MF_GRAYED), 2, TXT_OPEN_LOCATION);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -355,6 +411,11 @@ static void ListMenu(LPARAM lp) {
         _snwprintf(args, MAX_PATH + 16, L"/select,\"%ls\"", path);
         ShellExecuteW(hWnd, NULL, L"explorer.exe", args, NULL, SW_SHOWNORMAL);
     } else if (cmd == 3) CopyText(name);
+    else if (cmd == 4) {
+        TogglePin(name);
+        ApplyView();
+        InvalidateRect(hList, NULL, FALSE); // ApplyView only repaints rows whose text changed; the font changed too
+    }
 }
 
 static void Restore(void) {
@@ -399,6 +460,21 @@ static LRESULT CALLBACK ListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PT
     return DefSubclassProc(h, msg, wp, lp);
 }
 
+// The clear "×" is a child of the search box, so its click and color messages come here
+static LRESULT CALLBACK SearchProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
+    if (msg == WM_COMMAND && (HWND)lp == hClear && HIWORD(wp) == STN_CLICKED) {
+        SetWindowTextW(h, L""); // EN_CHANGE updates the view and hides the ×
+        SetFocus(h);
+        return 0;
+    }
+    if (msg == WM_CTLCOLORSTATIC && (HWND)lp == hClear) {
+        SetTextColor((HDC)wp, GetSysColor(COLOR_GRAYTEXT));
+        SetBkColor((HDC)wp, GetSysColor(COLOR_WINDOW));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == wmTaskbarCreated) { // re-add the tray icon after Explorer restarts
         Shell_NotifyIconW(NIM_ADD, &nid);
@@ -423,9 +499,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ReleaseDC(h, dc);
         ctlH = tm.tmHeight + S(6);
         btnW = sz.cx + S(24);
-        hSearch = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        hSearch = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | ES_AUTOHSCROLL,
                                   0, 0, 0, 0, h, (HMENU)ID_SEARCH, NULL, NULL);
         SendMessageW(hSearch, EM_SETCUEBANNER, TRUE, (LPARAM)TXT_SEARCH_HINT);
+        hClear = CreateWindowW(L"STATIC", TXT_CLEAR, WS_CHILD | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE, // shown while there's text
+                               0, 0, 0, 0, hSearch, NULL, NULL, NULL);
+        SetWindowSubclass(hSearch, SearchProc, 0, 0);
         hKill = CreateWindowW(L"BUTTON", TXT_END_TASK, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                               0, 0, 0, 0, h, (HMENU)ID_KILL, NULL, NULL);
         hList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -433,8 +512,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
         SetWindowTheme(hList, L"Explorer", NULL);
         hStatus = CreateWindowW(STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, h, NULL, NULL, NULL);
-        HWND ctl[] = { hSearch, hKill, hList, hStatus };
-        for (int i = 0; i < 4; i++) SendMessageW(ctl[i], WM_SETFONT, (WPARAM)f, FALSE);
+        HWND ctl[] = { hSearch, hClear, hKill, hList, hStatus };
+        for (int i = 0; i < 5; i++) SendMessageW(ctl[i], WM_SETFONT, (WPARAM)f, FALSE);
         hHeader = ListView_GetHeader(hList);
         SetWindowSubclass(hList, ListProc, 0, 0);
         LOGFONTW lf = nm.lfMessageFont;
@@ -462,6 +541,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ChangeWindowMessageFilterEx(h, wmTaskbarCreated, MSGFLT_ALLOW, NULL);
         ChangeWindowMessageFilterEx(h, wmShowMe, MSGFLT_ALLOW, NULL); // a non-admin second launch must reach an admin instance
         Shell_NotifyIconW(NIM_ADD, &nid); // the tray icon stays until exit
+        LoadPins();
         Refresh();
         SetTimer(h, 1, 1000, NULL);
         return 0;
@@ -474,9 +554,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rs;
         SendMessageW(hStatus, WM_SIZE, 0, 0);
         LayoutStatus();
-        GetWindowRect(hStatus, &rs);
         int W = LOWORD(lp), H = HIWORD(lp), m = S(8), top = m * 2 + ctlH;
         MoveWindow(hSearch, m, m, S(260), ctlH, TRUE);
+        GetClientRect(hSearch, &rs); // × fills a square at the right end; the text keeps clear of it
+        MoveWindow(hClear, rs.right - rs.bottom, 0, rs.bottom, rs.bottom, TRUE);
+        SendMessageW(hSearch, EM_SETMARGINS, EC_RIGHTMARGIN, MAKELPARAM(0, rs.bottom));
+        GetWindowRect(hStatus, &rs);
         MoveWindow(hKill, W - m - btnW, m, btnW, ctlH, TRUE);
         MoveWindow(hList, 0, top, W, H - top - (rs.bottom - rs.top), TRUE);
         return 0;
@@ -491,10 +574,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == ID_SEARCH && HIWORD(wp) == EN_CHANGE) {
             GetWindowTextW(hSearch, query, 128);
+            ShowWindow(hClear, query[0] ? SW_SHOW : SW_HIDE);
             ApplyView();
         } else if (LOWORD(wp) == ID_KILL) KillSelected();
         return 0;
-    case WM_CONTEXTMENU: // the ListView forwards right-clicks here; wp is the header for header right-clicks
+    case WM_CONTEXTMENU: // the ListView forwards right-clicks here, header ones included (ListMenu skips those)
         if ((HWND)wp != hList) break; // title bar right-click still gets the system menu
         ListMenu(lp);
         return 0;
@@ -506,11 +590,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
             if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT && cd->nmcd.dwItemSpec < (DWORD_PTR)nView) {
                 static const COLORREF bg[] = { 0, RGB(255, 241, 184), RGB(255, 205, 205) }; // yellow: warning, red: critical
-                int lv = Level(&shown[view[cd->nmcd.dwItemSpec]]);
-                if (lv) {
-                    cd->clrTextBk = bg[lv];
-                    return CDRF_NEWFONT;
-                }
+                const Proc *p = &shown[view[cd->nmcd.dwItemSpec]];
+                int lv = Level(p);
+                if (lv) cd->clrTextBk = bg[lv];
+                if (p->pinned) SelectObject(cd->nmcd.hdc, boldFont); // pinned rows are bold
+                if (lv || p->pinned) return CDRF_NEWFONT;
             }
             return CDRF_DODEFAULT;
         }
@@ -568,6 +652,11 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     ShowWindow(hWnd, show);
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN && m.wParam == 'F' && GetKeyState(VK_CONTROL) < 0) { // Ctrl+F: jump to search
+            SetFocus(hSearch);
+            SendMessageW(hSearch, EM_SETSEL, 0, -1);
+            continue;
+        }
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
