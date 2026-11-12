@@ -33,12 +33,26 @@
 #define TXT_UNPIN         L"Unpin"
 #define TXT_RESTORE       L"Restore"
 #define TXT_EXIT          L"Exit"
+#define TXT_SHOW_BAR      L"Show on taskbar"
+#define TXT_BAR_CPU       L"CPU"  // taskbar readout labels
+#define TXT_BAR_MEM       L"MEM"
+#define TXT_BAR_CPU_TEMP  L"CPU"
+#define TXT_BAR_DISK_TEMP L"DISK"
 
 // Highlight thresholds: CPU as % of the whole machine (same as the CPU column), memory as private working set
 #define CPU_WARN 10.0
 #define CPU_HIGH 30.0
 #define MEM_WARN (1ULL << 30) // 1 GB
 #define MEM_HIGH (4ULL << 30) // 4 GB
+// Taskbar readout: values turn amber at WARN and red at HIGH
+#define BAR_CPU_WARN   60 // total CPU %
+#define BAR_CPU_HIGH   85
+#define BAR_MEM_WARN   75 // memory load %
+#define BAR_MEM_HIGH   90
+#define BAR_CPUT_WARN  75 // °C
+#define BAR_CPUT_HIGH  90
+#define BAR_DISKT_WARN 55 // °C, hottest SSD
+#define BAR_DISKT_HIGH 70
 
 enum { ID_SEARCH = 1, ID_KILL, ID_LIST };
 #define WM_TRAY (WM_APP + 1)
@@ -87,7 +101,7 @@ static int rightW; // width of the status bar's temperature part
 static Snap snaps[2]; static int si;  // snaps[si] is the current sample, the other is the previous one
 static Proc *shown; static int *view, nView, viewCap;
 static BYTE *buf; static ULONG bufSize;
-static ULONGLONG lastTotal, lastIdle;
+static ULONGLONG lastTotal;
 static int sortCol = 3, sortDesc = 1, dpi = 96, ctlH, btnW;
 static WCHAR query[128];
 static NOTIFYICONDATAW nid;
@@ -96,6 +110,8 @@ static PDH_HQUERY pq;
 static PDH_HCOUNTER pc;
 static int diskT[16], nDisk, tick;
 static WCHAR pins[64][128]; static int nPins; // pinned process names, saved in obtaskmgr.ini (ponytail: 64 max, grow if anyone hits it)
+static double sysCpu; static int cpuT; static MEMORYSTATUSEX ms = { sizeof ms }; // latest Sample()
+static HWND hBar; static HFONT barFont, barBold; static int barOn = 1; // taskbar readout
 
 static int S(int x) { return MulDiv(x, dpi, 96); }
 static ULONGLONG U(FILETIME f) { return (ULONGLONG)f.dwHighDateTime << 32 | f.dwLowDateTime; }
@@ -129,7 +145,7 @@ static int Pinned(const WCHAR *name) {
     return 0;
 }
 
-static void LoadPins(void) {
+static void LoadSettings(void) {
     static WCHAR b[64 * 128 + 2];
     WCHAR alt[MAX_PATH];
     GetModuleFileNameW(NULL, ini, MAX_PATH);
@@ -142,6 +158,16 @@ static void LoadPins(void) {
     for (DWORD i = 0; i < n; i++)
         if (b[i] == '|') b[i] = 0;
     for (WCHAR *s = b; *s && nPins < 64; s += lstrlenW(s) + 1) lstrcpynW(pins[nPins++], s, 128);
+    barOn = GetPrivateProfileIntW(L"Settings", L"Taskbar", 1, ini);
+}
+
+static void SaveSetting(const WCHAR *key, const WCHAR *val) {
+    if (!WritePrivateProfileStringW(L"Settings", key, val, ini)) { // exe folder not writable (e.g. Program Files)
+        ExpandEnvironmentStringsW(APPDATA_DIR, ini, MAX_PATH);
+        CreateDirectoryW(ini, NULL);
+        PathAppendW(ini, INI_NAME);
+        WritePrivateProfileStringW(L"Settings", key, val, ini);
+    }
 }
 
 static void TogglePin(const WCHAR *name) {
@@ -152,12 +178,7 @@ static void TogglePin(const WCHAR *name) {
     else if (nPins < 64) lstrcpynW(pins[nPins++], name, 128);
     for (i = 0; i < nPins; i++) k += lstrlenW(lstrcpyW(b + k, pins[i])), b[k++] = '|';
     b[k ? k - 1 : 0] = 0; // drop the trailing '|'
-    if (!WritePrivateProfileStringW(L"Settings", L"Pinned", b, ini)) { // exe folder not writable (e.g. Program Files)
-        ExpandEnvironmentStringsW(APPDATA_DIR, ini, MAX_PATH);
-        CreateDirectoryW(ini, NULL);
-        PathAppendW(ini, INI_NAME);
-        WritePrivateProfileStringW(L"Settings", L"Pinned", b, ini);
-    }
+    SaveSetting(L"Pinned", b);
     for (i = 0; i < snaps[si].n; i++) snaps[si].p[i].pinned = Pinned(snaps[si].p[i].name);
 }
 
@@ -266,6 +287,20 @@ static int CpuTemp(void) {
     return (int)(t + 0.5);
 }
 
+// System-wide readings for the status bar and the taskbar readout. Runs once per timer tick, also while
+// the window is hidden if the taskbar readout is on (no process enumeration, so it's cheap).
+static void Sample(void) {
+    static ULONGLONG t0, i0;
+    FILETIME fi, fk, fu;
+    GetSystemTimes(&fi, &fk, &fu);
+    ULONGLONG total = U(fk) + U(fu), idle = U(fi); // kernel time includes idle
+    sysCpu = t0 && total > t0 ? (double)(total - t0 - (idle - i0)) * 100 / (total - t0) : 0;
+    t0 = total, i0 = idle;
+    GlobalMemoryStatusEx(&ms);
+    cpuT = CpuTemp();
+    if (tick++ % 10 == 0) ReadDiskTemps(); // disk temps change slowly: read every 10 s (each read is a ~10 ms device round trip)
+}
+
 static void Refresh(void) {
     ULONG need = 0;
     NTSTATUS st;
@@ -275,10 +310,9 @@ static void Refresh(void) {
 
     FILETIME fi, fk, fu;
     GetSystemTimes(&fi, &fk, &fu);
-    ULONGLONG total = U(fk) + U(fu), idle = U(fi); // kernel time includes idle
+    ULONGLONG total = U(fk) + U(fu);
     double dt = lastTotal ? (double)(total - lastTotal) : 0;
-    double sysCpu = dt > 0 ? (dt - (double)(idle - lastIdle)) * 100 / dt : 0;
-    lastTotal = total, lastIdle = idle;
+    lastTotal = total;
 
     Snap *o = &snaps[si], *c = &snaps[si ^= 1];
     c->n = 0;
@@ -306,15 +340,12 @@ static void Refresh(void) {
         if (!e->NextEntryOffset) break;
     }
 
-    MEMORYSTATUSEX ms = { sizeof ms };
-    GlobalMemoryStatusEx(&ms);
-    if (tick++ % 10 == 0) ReadDiskTemps(); // disk temps change slowly: read every 10 s (each read is a ~10 ms device round trip)
     WCHAR s[128], t[256];
     _snwprintf(s, 128, TXT_STATUS, c->n, sysCpu, ms.dwMemoryLoad,
                (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0, ms.ullTotalPhys / 1073741824.0);
     SendMessageW(hStatus, SB_SETTEXTW, 0, (LPARAM)s);
     // Temperature part (two \t = right-aligned); unavailable readings are omitted
-    int ct = CpuTemp(), k = _snwprintf(t, 16, L"\t\t");
+    int ct = cpuT, k = _snwprintf(t, 16, L"\t\t");
     if (ct) k += _snwprintf(t + k, 32, TXT_CPU_TEMP, ct);
     for (int i = 0; i < nDisk; i++) {
         if (!i && ct) k += _snwprintf(t + k, 8, L"    ");
@@ -418,6 +449,114 @@ static void ListMenu(LPARAM lp) {
     }
 }
 
+// ---- Taskbar readout: a layered child of the taskbar, just left of the notification area (like TrafficMonitor).
+// Being a child, it follows the taskbar through auto-hide and full-screen apps with no topmost fights.
+// ponytail: horizontal taskbar on the primary monitor only; it can overlap left-aligned task buttons when they reach it.
+typedef struct { const WCHAR *label, *fmt; WCHAR val[8]; int lv, lx, vr; } Cell;
+
+static int AddCell(Cell *c, const WCHAR *label, const WCHAR *fmt, double x, double warn, double high) {
+    c->label = label, c->fmt = fmt, c->lv = (x >= warn) + (x >= high);
+    _snwprintf(c->val, 8, fmt, x);
+    return 1;
+}
+
+// Pixels of r hold white-on-black grayscale text: turn coverage into premultiplied alpha in color c
+static void Tint(DWORD *px, int w, int h, RECT r, COLORREF c, int alpha) {
+    for (int y = max(r.top, 0); y < min(r.bottom, h); y++)
+        for (int x = max(r.left, 0); x < min(r.right, w); x++) {
+            DWORD *p = &px[y * w + x], a = (*p >> 8 & 255) * alpha / 255;
+            *p = a << 24 | GetRValue(c) * a / 255 << 16 | GetGValue(c) * a / 255 << 8 | GetBValue(c) * a / 255;
+        }
+}
+
+static void UpdateBar(void) {
+    if (!hBar) return;
+    Cell c[4]; // column-major 2 rows: CPU% / MEM% | CPU temp / disk temp; unavailable temps are left out
+    int n = 0, dk = 0;
+    for (int i = 0; i < nDisk; i++) dk = max(dk, diskT[i]); // hottest disk
+    n += AddCell(&c[n], TXT_BAR_CPU, L"%.0f%%", sysCpu, BAR_CPU_WARN, BAR_CPU_HIGH);
+    n += AddCell(&c[n], TXT_BAR_MEM, L"%.0f%%", ms.dwMemoryLoad, BAR_MEM_WARN, BAR_MEM_HIGH);
+    if (cpuT) n += AddCell(&c[n], TXT_BAR_CPU_TEMP, L"%.0f°C", cpuT, BAR_CPUT_WARN, BAR_CPUT_HIGH);
+    if (dk) n += AddCell(&c[n], TXT_BAR_DISK_TEMP, L"%.0f°C", dk, BAR_DISKT_WARN, BAR_DISKT_HIGH);
+
+    // Layout: per column, labels left-aligned, values right-aligned in a width reserved for "100", so nothing jiggles
+    HDC dc = CreateCompatibleDC(NULL);
+    TEXTMETRICW tm;
+    SIZE s;
+    WCHAR t[8];
+    SelectObject(dc, barBold);
+    GetTextMetricsW(dc, &tm);
+    int x = S(6), gap = S(6);
+    for (int col = 0; col < n; col += 2) {
+        int lw = 0, vw = 0, end = min(col + 2, n);
+        for (int i = col; i < end; i++) {
+            SelectObject(dc, barFont);
+            GetTextExtentPoint32W(dc, c[i].label, lstrlenW(c[i].label), &s);
+            lw = max(lw, s.cx);
+            SelectObject(dc, barBold);
+            GetTextExtentPoint32W(dc, t, _snwprintf(t, 8, c[i].fmt, 100.0), &s);
+            vw = max(vw, s.cx);
+        }
+        for (int i = col; i < end; i++) c[i].lx = x, c[i].vr = x + lw + gap + vw;
+        x += lw + gap + vw + S(14);
+    }
+    HWND tray = GetParent(hBar), notify = FindWindowExW(tray, NULL, L"TrayNotifyWnd", NULL);
+    RECT tr, nr;
+    GetClientRect(tray, &tr);
+    nr = tr, nr.left = tr.right;
+    if (notify) {
+        GetWindowRect(notify, &nr);
+        MapWindowPoints(HWND_DESKTOP, tray, (POINT *)&nr, 2);
+    }
+    int W = x - S(14) + S(6), H = tr.bottom, y0 = (H - 2 * tm.tmHeight) / 2;
+
+    // Draw white text on black, then tint each label/value by its coverage: per-pixel alpha keeps the taskbar's
+    // own (Mica/acrylic) background showing through, with grayscale anti-aliasing instead of ClearType fringes
+    BITMAPINFO bi = { { sizeof bi.bmiHeader, W, -H, 1, 32, BI_RGB } };
+    DWORD *px, light = 0, size = sizeof light;
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    if (!bm) return (void)DeleteDC(dc);
+    HGDIOBJ ob = SelectObject(dc, bm);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"SystemUsesLightTheme", RRF_RT_REG_DWORD, NULL, &light, &size); // the taskbar follows the system theme
+    static const COLORREF fg[2][3] = { { RGB(255, 255, 255), RGB(255, 200, 60), RGB(255, 96, 96) },  // dark: normal, warn, high
+                                       { RGB(24, 24, 24), RGB(176, 96, 0), RGB(200, 30, 40) } };   // light
+    const COLORREF *col = fg[light != 0];
+    for (int i = 0; i < n; i++) {
+        int y = y0 + (i & 1) * tm.tmHeight, len = lstrlenW(c[i].val);
+        SelectObject(dc, barFont);
+        TextOutW(dc, c[i].lx, y, c[i].label, lstrlenW(c[i].label));
+        SelectObject(dc, barBold);
+        GetTextExtentPoint32W(dc, c[i].val, len, &s);
+        TextOutW(dc, c[i].vr - s.cx, y, c[i].val, len);
+        GdiFlush();
+        Tint(px, W, H, (RECT){ c[i].lx, y, c[i].vr - s.cx, y + tm.tmHeight }, col[0], 150); // dimmed label
+        Tint(px, W, H, (RECT){ c[i].vr - s.cx, y, c[i].vr + S(2), y + tm.tmHeight }, col[c[i].lv], 255);
+    }
+    for (int i = 0; i < W * H; i++)
+        if (!(px[i] >> 24)) px[i] = 1 << 24; // alpha 1 instead of 0: invisible, but still catches clicks
+    SIZE sz = { W, H };
+    POINT z = { 0, 0 };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    SetWindowPos(hBar, HWND_TOP, nr.left - W, 0, W, H, SWP_NOACTIVATE); // the tray area grows/shrinks: follow it
+    UpdateLayeredWindow(hBar, NULL, NULL, &sz, dc, &z, 0, &bf, ULW_ALPHA);
+    SelectObject(dc, ob);
+    DeleteObject(bm);
+    DeleteDC(dc);
+}
+
+// Also called when Explorer restarts: the old window died with the old taskbar.
+// A layered window stays invisible until UpdateBar() paints it on the next tick, so stale readings never show.
+static void ShowBar(int on) {
+    if (hBar) DestroyWindow(hBar);
+    hBar = NULL;
+    HWND tray = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (on && tray)
+        hBar = CreateWindowExW(WS_EX_LAYERED, L"OBTaskbar", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, tray, NULL, GetModuleHandleW(NULL), NULL);
+}
+
 static void Restore(void) {
     int hidden = IsIconic(hWnd);
     ShowWindow(hWnd, hidden ? SW_RESTORE : SW_SHOW); // SW_RESTORE on a shown window would un-maximize it
@@ -428,6 +567,7 @@ static void Restore(void) {
 static void TrayMenu(void) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, TXT_RESTORE);
+    AppendMenuW(m, MF_STRING | (barOn ? MF_CHECKED : 0), 3, TXT_SHOW_BAR);
     AppendMenuW(m, MF_STRING, 2, TXT_EXIT);
     SetMenuDefaultItem(m, 1, FALSE);
     POINT pt;
@@ -438,6 +578,18 @@ static void TrayMenu(void) {
     DestroyMenu(m);
     if (cmd == 1) Restore();
     else if (cmd == 2) DestroyWindow(hWnd);
+    else if (cmd == 3) {
+        ShowBar(barOn ^= 1);
+        SaveSetting(L"Taskbar", barOn ? L"1" : L"0");
+    }
+}
+
+// Taskbar readout: click opens the window, right-click shows the tray menu
+static LRESULT CALLBACK BarProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_LBUTTONUP) Restore();
+    else if (msg == WM_RBUTTONUP) TrayMenu();
+    else return DefWindowProcW(h, msg, wp, lp);
+    return 0;
 }
 
 // The header sends NM_CUSTOMDRAW only to its parent ListView, which doesn't forward it, so subclass the ListView
@@ -478,6 +630,7 @@ static LRESULT CALLBACK SearchProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == wmTaskbarCreated) { // re-add the tray icon after Explorer restarts
         Shell_NotifyIconW(NIM_ADD, &nid);
+        ShowBar(barOn);
         return 0;
     }
     if (msg == wmShowMe) { // a second launch asked us to come to the front
@@ -519,6 +672,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         LOGFONTW lf = nm.lfMessageFont;
         lf.lfWeight = FW_BOLD;
         boldFont = CreateFontIndirectW(&lf);
+        lf.lfQuality = ANTIALIASED_QUALITY; // taskbar readout: grayscale AA, ClearType can't do per-pixel alpha
+        lf.lfWeight = FW_SEMIBOLD;
+        barBold = CreateFontIndirectW(&lf);
+        lf.lfWeight = FW_NORMAL;
+        barFont = CreateFontIndirectW(&lf);
         static const WCHAR *cols[] = { TXT_COL_NAME, TXT_COL_PID, TXT_COL_CPU, TXT_COL_MEM };
         static const int w[] = { 280, 80, 80, 110 };
         for (int i = 0; i < 4; i++) {
@@ -541,7 +699,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ChangeWindowMessageFilterEx(h, wmTaskbarCreated, MSGFLT_ALLOW, NULL);
         ChangeWindowMessageFilterEx(h, wmShowMe, MSGFLT_ALLOW, NULL); // a non-admin second launch must reach an admin instance
         Shell_NotifyIconW(NIM_ADD, &nid); // the tray icon stays until exit
-        LoadPins();
+        LoadSettings();
+        Sample();
+        ShowBar(barOn);
+        UpdateBar();
         Refresh();
         SetTimer(h, 1, 1000, NULL);
         return 0;
@@ -569,7 +730,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (lp == WM_RBUTTONUP) TrayMenu();
         return 0;
     case WM_TIMER:
-        if (!IsIconic(h)) Refresh(); // no refresh while minimized: zero cost
+        if (!hBar && IsIconic(h)) return 0; // minimized with no taskbar readout: zero cost
+        Sample();
+        UpdateBar();
+        if (!IsIconic(h)) Refresh(); // the process list only while visible
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == ID_SEARCH && HIWORD(wp) == EN_CHANGE) {
@@ -615,6 +779,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         Shell_NotifyIconW(NIM_DELETE, &nid);
+        ShowBar(0);
         PostQuitMessage(0);
         return 0;
     }
@@ -647,6 +812,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
                        (HBRUSH)(COLOR_WINDOW + 1), NULL, L"OBTaskmgr",
                        LoadImageW(hi, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0) };
     RegisterClassExW(&wc);
+    WNDCLASSW bc = { 0, BarProc, 0, 0, hi, NULL, LoadCursorW(NULL, IDC_ARROW), NULL, NULL, L"OBTaskbar" };
+    RegisterClassW(&bc);
     hWnd = CreateWindowW(L"OBTaskmgr", TXT_TITLE, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                          CW_USEDEFAULT, CW_USEDEFAULT, S(640), S(680), NULL, NULL, hi, NULL);
     ShowWindow(hWnd, show);
